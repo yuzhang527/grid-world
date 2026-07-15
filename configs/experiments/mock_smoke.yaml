@@ -1,0 +1,14 @@
+experiment:
+  name: mock_smoke
+  max_steps: 20
+  feedback_type: adjacent_exact
+model:
+  backend: mock
+  name: mock_oracle
+  dtype: auto
+  trust_remote_code: false
+generation:
+  temperature: 0.0
+  max_tokens: 256
+  batch_size: 32
+  repair_invalid_json: false

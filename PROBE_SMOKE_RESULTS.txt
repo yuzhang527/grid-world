@@ -1,0 +1,42 @@
+[probe] X=(160, 2, 2, 32) rows=160 tasks=6 positions=['prompt_last'] layers=[0]
+[probe/sklearn] 1/6 gold_local_DOWN_OFUW prompt_last L0
+[probe/sklearn] 2/6 gold_local_LEFT_OFUW prompt_last L0
+[probe/sklearn] 3/6 gold_local_RIGHT_OFUW prompt_last L0
+[probe/sklearn] 4/6 gold_local_UP_OFUW prompt_last L0
+[probe/sklearn] 5/6 true_action_RIGHT_is_astar_best prompt_last L0
+[probe/sklearn] 6/6 true_action_UP_is_astar_best prompt_last L0
+[32mSaved [0m[1;32m6[0m[32m aggregate rows.[0m
+Spreadsheet runtime warmup failed during python startup
+Traceback (most recent call last):
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 785, in warm_spreadsheet_runtime
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 720, in _warm_feature_flows
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 704, in _warm_collaboration_flows
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/generated/interface/models.py", line 30820, in hydrate_crdt_from_proto
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/rpc/remote.py", line 749, in __call__
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/rpc/client.py", line 150, in call
+artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.
+/opt/pyvenv/lib/python3.13/site-packages/sklearn/metrics/_classification.py:2924: UserWarning: y_pred contains classes not in y_true
+  warnings.warn("y_pred contains classes not in y_true")
+
+[1m{[0m
+    [32m'best_by_task'[0m: 
+[32m'/mnt/data/grid-world/_probe_smoke/run/probes/best_by_task.csv'[0m,
+    [32m'summary'[0m: [32m'/mnt/data/grid-world/_probe_smoke/run/probes/summary.md'[0m,
+    [32m'figures'[0m: [1m[[0m
+        [32m'/mnt/data/grid-world/_probe_smoke/run/probes/figures/local_heatmap.png'[0m
+,
+        [32m'/mnt/data/grid-world/_probe_smoke/run/probes/figures/planning_heatmap.p[0m
+[32mng'[0m
+    [1m][0m
+[1m}[0m
+Spreadsheet runtime warmup failed during python startup
+Traceback (most recent call last):
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 785, in warm_spreadsheet_runtime
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 720, in _warm_feature_flows
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/spreadsheet_warmup.py", line 704, in _warm_collaboration_flows
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/generated/interface/models.py", line 30820, in hydrate_crdt_from_proto
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/rpc/remote.py", line 749, in __call__
+  File "/tmp/tmp.yTcnQsZYiA/artifact_tool_v2-2.8.4/artifact_tool/rpc/client.py", line 150, in call
+artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.

@@ -1,0 +1,10 @@
+schema_version: "1.0"
+prefix: A_seed
+seed_start: 123
+num_episodes: 100
+size: 5
+num_obstacles: 4
+start: [0, 0]
+goal: [4, 4]
+require_unique_shortest_path: false
+max_attempts_per_episode: 10000
