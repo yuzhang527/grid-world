@@ -1,0 +1,27 @@
+maps:
+  config: configs/maps/grid5x5_diverse_1000.yaml
+  output: data/generated/grid5x5_diverse_1000.jsonl
+
+generation:
+  config: configs/experiments/qwen25_7b_no_grid_diverse5x5.yaml
+  maps: data/generated/grid5x5_diverse_1000.jsonl
+  run: runs/qwen25_7b_no_grid_diverse5x5_1000
+  gpus: "0,1,2,3"
+  parallel_mode: data
+  resume: true
+
+activations:
+  model: Qwen/Qwen2.5-7B-Instruct
+  layers: all
+  positions: prompt_last,pre_action_token,mean_history
+  device: cuda:0
+  dtype: auto
+
+probes:
+  groups: cells,memory,true_cells,true_cells_unobserved,planning
+  positions: prompt_last,pre_action_token,mean_history
+  layers: all
+  backend: torch
+  device: cuda:0
+  splits: 20
+  epochs: 60

@@ -28,7 +28,8 @@ def run_pipeline(config_path, stages):
                                 layers=str(acfg.get("layers","auto")),
                                 positions=str(acfg.get("positions","default")),
                                 device=str(acfg.get("device","cuda:0")),
-                                dtype=str(acfg.get("dtype","auto")))
+                                dtype=str(acfg.get("dtype","auto")),
+                                batch_size=int(acfg.get("batch_size",1)))
         elif stage=="probes":
             train_probes(run_dir=run,groups=str(pcfg.get("groups","local,cells,planning")),
                          positions=str(pcfg.get("positions","auto")),

@@ -5,7 +5,7 @@ from rich import print
 from rich.console import Console
 from rich.table import Table
 from grid_world.activations.extract import extract_activations
-from grid_world.env.maps import generate_maps,show_map,validate_maps
+from grid_world.env.maps import generate_maps,show_map,validate_maps,summarize_maps
 from grid_world.evaluation.behavior import summarize_run
 from grid_world.evaluation.validate import validate_run
 from grid_world.generation.launcher import generate_trajectories
@@ -31,6 +31,11 @@ def maps_generate(config:Path=typer.Option(...,exists=True),output:Path=typer.Op
 
 @maps_app.command("validate")
 def maps_validate(maps:Path=typer.Option(...,exists=True)): print(validate_maps(maps))
+
+@maps_app.command("summarize")
+def maps_summarize(maps: Path = typer.Option(..., exists=True)):
+    print(summarize_maps(maps))
+
 
 @maps_app.command("show")
 def maps_show(maps:Path=typer.Option(...,exists=True),
@@ -63,12 +68,14 @@ def targets_build(run:Path=typer.Option(...,exists=True)):
 def activations_extract(run:Path=typer.Option(...,exists=True),model:str=typer.Option(...),
                         layers:str=typer.Option("auto"),positions:str=typer.Option("default"),
                         device:str=typer.Option("cuda:0"),dtype:str=typer.Option("auto"),
+                        batch_size:int=typer.Option(1,min=1),
                         include_repaired:bool=typer.Option(False),
                         include_parse_errors:bool=typer.Option(False),
                         max_rows:int|None=typer.Option(None),
                         trust_remote_code:bool=typer.Option(False)):
     print(extract_activations(run_dir=run,model_name=model,layers=layers,positions=positions,
-                              device=device,dtype=dtype,include_repaired=include_repaired,
+                              device=device,dtype=dtype,batch_size=batch_size,
+                              include_repaired=include_repaired,
                               include_parse_errors=include_parse_errors,max_rows=max_rows,
                               trust_remote_code=trust_remote_code))
 

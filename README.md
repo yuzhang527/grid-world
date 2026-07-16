@@ -354,3 +354,8 @@ grid-world probes report --run "$RUN"
 - Stage manifests include config hashes and upstream paths.
 - Targets and activations join on `(episode_id, step_id)`.
 - Probe decodability does not by itself prove causal use.
+
+
+## Diverse 5x5 experiment
+
+See [`docs/DIVERSE_5X5.md`](docs/DIVERSE_5X5.md) for the balanced 1000-episode 5x5 experiment.
