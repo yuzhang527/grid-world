@@ -1,0 +1,35 @@
+schema_version: "coordinate-belief-v4.1"
+
+experiment:
+  name: qwen25_32b_coordinate_belief_v4_200
+  condition: coordinate_belief_v4
+  num_episodes: 200
+  max_steps: 20
+  feedback_type: adjacent_exact
+  coordinate_system: Cartesian(x-right,y-up,origin-bottom-left)
+
+model:
+  backend: vllm
+  name: Qwen/Qwen2.5-32B-Instruct
+  dtype: bfloat16
+  tensor_parallel_size: 4
+
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 320
+  max_model_len: 8192
+  gpu_memory_utilization: 0.90
+  repair_invalid_json: true
+
+belief_output:
+  type: known_coordinate_sets
+  schema:
+    belief_coordinates:
+      F: [[x, y]]
+      O: [[x, y]]
+    action: UP
+  unknown_semantics: omitted coordinates are U
+  matrix_output_forbidden: true
+  compatibility_normalization: parsed_belief_grid[y][x]
+

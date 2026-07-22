@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""Trajectory viewer with canonical out-of-fold gold-belief decoding.
+
+This script deliberately does not consume legacy trajectory-viewer caches. It
+trains/loads a versioned 5-fold (80/20) out-of-fold probe cache whose schema is
+validated before HTML generation. The decoded map uses exactly the 25
+``gold_cell_x*_y*_OFU`` tasks.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import math
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+
+CELL_TASK_RE = re.compile(r"^gold_cell_x(\d+)_y(\d+)_OFU$")
+TRUE_TASK_RE = re.compile(r"^true_cell_x(\d+)_y(\d+)_FO$")
+EXPLICIT_TASK_RE = re.compile(r"^explicit_cell_x(\d+)_y(\d+)_OFU$")
+CACHE_SCHEMA = "trajectory-gold-belief-oof-v3"
+VALID_BELIEF = {"F", "O", "U"}
+VALID_TRUE = {"F", "O"}
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON at {path}:{line_no}: {exc}") from exc
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Expected object at {path}:{line_no}")
+            rows.append(item)
+    return rows
+
+
+def first_present(row: Mapping[str, Any], names: Sequence[str], default: Any = None) -> Any:
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    return default
+
+
+def episode_id_of(row: Mapping[str, Any]) -> str:
+    value = first_present(row, ("episode_id", "episode", "episode_key", "id"))
+    if value is None:
+        raise KeyError(f"Row has no episode id: keys={list(row)[:20]}")
+    return str(value)
+
+
+def step_id_of(row: Mapping[str, Any], fallback: int | None = None) -> str:
+    value = first_present(row, ("step_id", "step", "t", "step_index"), fallback)
+    if value is None:
+        raise KeyError(f"Row has no step id: keys={list(row)[:20]}")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value)
+
+
+def row_key(row: Mapping[str, Any], fallback: int | None = None) -> tuple[str, str]:
+    return episode_id_of(row), step_id_of(row, fallback)
+
+
+def stable_episode_folds(episode_ids: Iterable[str], n_folds: int) -> dict[str, int]:
+    unique = sorted(set(map(str, episode_ids)), key=lambda x: hashlib.sha256(x.encode()).hexdigest())
+    if len(unique) < n_folds:
+        raise ValueError(f"Need at least {n_folds} episodes, found {len(unique)}")
+    return {episode_id: index % n_folds for index, episode_id in enumerate(unique)}
+
+
+def load_positions(path: Path) -> list[str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return [str(x) for x in payload]
+    if isinstance(payload, dict):
+        for key in ("positions", "names", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [str(x) for x in value]
+        if payload and all(isinstance(v, int) for v in payload.values()):
+            return [name for name, _ in sorted(payload.items(), key=lambda item: item[1])]
+    raise RuntimeError(f"Unsupported positions.json format: {path}")
+
+
+def choose_common_layer(run: Path, position: str, available_layers: Sequence[int], requested: str) -> int:
+    if requested != "auto":
+        layer = int(requested)
+        if layer not in available_layers:
+            raise ValueError(f"Layer {layer} is not available; choices={list(available_layers)}")
+        return layer
+
+    candidates = [
+        run / "probes" / "probe_results.csv",
+        run / "probe_results.csv",
+        run / "analysis" / "probe_results.csv",
+    ]
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None
+
+    if pd is not None:
+        for path in candidates:
+            if not path.is_file():
+                continue
+            frame = pd.read_csv(path)
+            required = {"task", "position", "layer", "macro_f1_mean"}
+            if not required.issubset(frame.columns):
+                continue
+            subset = frame[
+                frame["task"].astype(str).str.match(r"^gold_cell_x\d+_y\d+_OFU$")
+                & (frame["position"].astype(str) == position)
+            ].copy()
+            if subset.empty:
+                continue
+            summary = subset.groupby("layer", as_index=False)["macro_f1_mean"].mean()
+            summary = summary[summary["layer"].astype(int).isin(available_layers)]
+            if not summary.empty:
+                best = summary.sort_values(["macro_f1_mean", "layer"], ascending=[False, True]).iloc[0]
+                return int(best["layer"])
+
+    # Prefer the middle-to-late part of the network if there is no report.
+    return int(available_layers[round(0.60 * (len(available_layers) - 1))])
+
+
+def episode_equal_weights(episodes: Sequence[str]) -> np.ndarray:
+    counts = Counter(episodes)
+    return np.asarray([1.0 / counts[e] for e in episodes], dtype=np.float64)
+
+
+def position_valid_mask(run: Path, position_index: int, n_rows: int) -> np.ndarray:
+    path = run / "activations" / "position_mask.npy"
+    if not path.is_file():
+        return np.ones(n_rows, dtype=bool)
+    mask = np.load(path, mmap_mode="r")
+    if mask.shape[0] != n_rows:
+        raise RuntimeError(f"position_mask rows {mask.shape[0]} != activation rows {n_rows}")
+    if mask.ndim == 2:
+        return np.asarray(mask[:, position_index], dtype=bool)
+    if mask.ndim == 3:
+        return np.asarray(mask[:, position_index, :].any(axis=1), dtype=bool)
+    raise RuntimeError(f"Unsupported position_mask shape: {mask.shape}")
+
+
+def fit_oof_cell_probes(
+    run: Path,
+    selected_episode: str,
+    position: str,
+    requested_layer: str,
+    n_folds: int,
+    c_value: float,
+    max_iter: int,
+    force: bool,
+) -> tuple[dict[str, Any], Path]:
+    try:
+        from sklearn.linear_model import LogisticRegression as _SklearnLogisticRegression
+        import numpy as _single_class_np
+
+        # SINGLE_CLASS_SAFE_LOGREG_V2
+        class LogisticRegression:
+            # Drop-in local wrapper supporting a one-class viewer fold.
+
+            def __init__(self, *args, **kwargs):
+                self._args = args
+                self._kwargs = kwargs
+                self._model = None
+                self._constant = None
+                self.classes_ = None
+
+            def fit(self, X, y, sample_weight=None):
+                y_array = _single_class_np.asarray(y)
+                classes = _single_class_np.unique(y_array)
+                if classes.size == 0:
+                    raise ValueError("Cannot fit a decoder with zero training labels")
+                self.classes_ = classes
+                if classes.size == 1:
+                    self._constant = classes[0]
+                    self._model = None
+                    return self
+
+                self._constant = None
+                self._model = _SklearnLogisticRegression(*self._args, **self._kwargs)
+                if sample_weight is None:
+                    self._model.fit(X, y)
+                else:
+                    self._model.fit(X, y, sample_weight=sample_weight)
+                self.classes_ = self._model.classes_
+                return self
+
+            def predict(self, X):
+                if self._constant is not None:
+                    return _single_class_np.full(len(X), self._constant)
+                return self._model.predict(X)
+
+            def predict_proba(self, X):
+                if self._constant is not None:
+                    return _single_class_np.ones((len(X), 1), dtype=float)
+                return self._model.predict_proba(X)
+
+            def decision_function(self, X):
+                if self._constant is not None:
+                    return _single_class_np.zeros(len(X), dtype=float)
+                return self._model.decision_function(X)
+
+            def score(self, X, y, sample_weight=None):
+                prediction = self.predict(X)
+                correct = prediction == _single_class_np.asarray(y)
+                if sample_weight is None:
+                    return float(correct.mean())
+                weights = _single_class_np.asarray(sample_weight, dtype=float)
+                return float((correct * weights).sum() / weights.sum())
+        from sklearn.metrics import accuracy_score, f1_score
+        from sklearn.preprocessing import StandardScaler
+    except ImportError as exc:
+        raise RuntimeError("Install scikit-learn: pip install scikit-learn") from exc
+
+    activations_dir = run / "activations"
+    meta_rows = read_jsonl(activations_dir / "meta.jsonl")
+    target_rows = read_jsonl(run / "targets" / "targets.jsonl")
+    targets_by_key = {row_key(row, i): row for i, row in enumerate(target_rows)}
+
+    x_path = activations_dir / "X.npy"
+    if not x_path.is_file():
+        raise FileNotFoundError(x_path)
+    x_all = np.load(x_path, mmap_mode="r")
+    if x_all.ndim != 4:
+        raise RuntimeError(f"Expected X shape [rows,positions,layers,hidden], got {x_all.shape}")
+    if len(meta_rows) != x_all.shape[0]:
+        raise RuntimeError(f"meta rows {len(meta_rows)} != activation rows {x_all.shape[0]}")
+
+    positions = load_positions(activations_dir / "positions.json")
+    if position not in positions:
+        raise ValueError(f"Position {position!r} unavailable; choices={positions}")
+    position_index = positions.index(position)
+
+    layer_values = [int(x) for x in np.load(activations_dir / "layers.npy").tolist()]
+    if len(layer_values) != x_all.shape[2]:
+        raise RuntimeError(f"layers.npy length {len(layer_values)} != X layer axis {x_all.shape[2]}")
+    layer = choose_common_layer(run, position, layer_values, requested_layer)
+    layer_index = layer_values.index(layer)
+
+    aligned_indices: list[int] = []
+    aligned_meta: list[dict[str, Any]] = []
+    aligned_targets: list[dict[str, Any]] = []
+    for index, meta in enumerate(meta_rows):
+        key = row_key(meta, index)
+        target = targets_by_key.get(key)
+        if target is None:
+            continue
+        aligned_indices.append(index)
+        aligned_meta.append(meta)
+        aligned_targets.append(target)
+
+    if not aligned_indices:
+        raise RuntimeError("No activation rows aligned with target rows by episode_id + step_id")
+
+    episodes = [episode_id_of(row) for row in aligned_meta]
+    fold_by_episode = stable_episode_folds(episodes, n_folds)
+    if selected_episode not in fold_by_episode:
+        raise RuntimeError(
+            f"Episode {selected_episode!r} has no activation rows. "
+            "It may have been filtered during activation extraction."
+        )
+    selected_fold = fold_by_episode[selected_episode]
+
+    cache_dir = run / "trajectory_viewer_cache_v3"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_position = re.sub(r"[^A-Za-z0-9_.-]+", "_", position)
+    cache_path = cache_dir / f"fold{selected_fold}of{n_folds}__{safe_position}__L{layer}__gold-belief.json"
+    if cache_path.is_file() and not force:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if cache.get("schema") != CACHE_SCHEMA:
+            raise RuntimeError(f"Incompatible cache schema in {cache_path}; use --force-probes")
+        return cache, cache_path
+
+    aligned_indices_np = np.asarray(aligned_indices, dtype=np.int64)
+    valid_position = position_valid_mask(run, position_index, x_all.shape[0])[aligned_indices_np]
+    test_mask = np.asarray([fold_by_episode[e] == selected_fold for e in episodes], dtype=bool)
+    train_mask = ~test_mask
+    train_mask &= valid_position
+    test_mask &= valid_position
+
+    train_indices = aligned_indices_np[train_mask]
+    test_indices = aligned_indices_np[test_mask]
+    if len(train_indices) == 0 or len(test_indices) == 0:
+        raise RuntimeError("Empty train or test partition after position-mask filtering")
+
+    print(
+        f"[viewer/v3] split={n_folds}-fold OOF selected_fold={selected_fold} "
+        f"train_episodes={len(set(np.asarray(episodes)[train_mask]))} "
+        f"test_episodes={len(set(np.asarray(episodes)[test_mask]))} "
+        f"train_steps={len(train_indices)} test_steps={len(test_indices)}"
+    )
+    print(f"[viewer/v3] activation_site={position}/L{layer}")
+
+    x_train_raw = np.asarray(x_all[train_indices, position_index, layer_index, :], dtype=np.float32)
+    x_test_raw = np.asarray(x_all[test_indices, position_index, layer_index, :], dtype=np.float32)
+    scaler = StandardScaler(copy=True)
+    x_train = scaler.fit_transform(x_train_raw)
+    x_test = scaler.transform(x_test_raw)
+    del x_train_raw, x_test_raw
+
+    train_meta = list(np.asarray(aligned_meta, dtype=object)[train_mask])
+    test_meta = list(np.asarray(aligned_meta, dtype=object)[test_mask])
+    train_targets = list(np.asarray(aligned_targets, dtype=object)[train_mask])
+    test_targets = list(np.asarray(aligned_targets, dtype=object)[test_mask])
+    weights = episode_equal_weights([episode_id_of(row) for row in train_meta])
+
+    task_names = sorted(
+        {key for row in aligned_targets for key in row if CELL_TASK_RE.match(key)},
+        key=lambda name: tuple(map(int, CELL_TASK_RE.match(name).groups())),  # type: ignore[union-attr]
+    )
+    if len(task_names) != 25:
+        raise RuntimeError(f"Expected exactly 25 gold belief tasks, found {len(task_names)}: {task_names}")
+
+    prediction_rows: dict[str, dict[str, dict[str, Any]]] = defaultdict(lambda: defaultdict(dict))
+    task_metrics: dict[str, Any] = {}
+
+    for task_index, task in enumerate(task_names, 1):
+        match = CELL_TASK_RE.match(task)
+        assert match is not None
+        x_coord, y_coord = map(int, match.groups())
+        y_train = np.asarray([str(row.get(task, "")) for row in train_targets], dtype=object)
+        y_test = np.asarray([str(row.get(task, "")) for row in test_targets], dtype=object)
+        train_valid = np.asarray([label in VALID_BELIEF for label in y_train], dtype=bool)
+        test_valid = np.asarray([label in VALID_BELIEF for label in y_test], dtype=bool)
+
+        classes = sorted(set(y_train[train_valid]))
+        if len(classes) < 2:
+            print(f"[viewer/v3] task={task} has one train class {classes}; ""using constant decoder (structural baseline, not a learned probe).")
+
+        clf = LogisticRegression(
+            C=c_value,
+            max_iter=max_iter,
+            class_weight="balanced",
+            solver="lbfgs",
+            n_jobs=1,
+        )
+        clf.fit(x_train[train_valid], y_train[train_valid], sample_weight=weights[train_valid])
+        pred = clf.predict(x_test[test_valid])
+        proba = clf.predict_proba(x_test[test_valid])
+        class_names = [str(x) for x in clf.classes_]
+
+        accuracy = float(accuracy_score(y_test[test_valid], pred)) if test_valid.any() else math.nan
+        macro_f1 = (
+            float(f1_score(y_test[test_valid], pred, labels=class_names, average="macro", zero_division=0))
+            if test_valid.any()
+            else math.nan
+        )
+        task_metrics[task] = {
+            "accuracy": accuracy,
+            "macro_f1": macro_f1,
+            "classes": class_names,
+            "train_counts": dict(Counter(y_train[train_valid])),
+            "test_counts": dict(Counter(y_test[test_valid])),
+        }
+
+        valid_test_positions = np.flatnonzero(test_valid)
+        for local_index, pred_label, probabilities in zip(valid_test_positions, pred, proba):
+            meta = test_meta[int(local_index)]
+            target = str(y_test[int(local_index)])
+            episode_id = episode_id_of(meta)
+            step_id = step_id_of(meta, int(local_index))
+            prob_map = {name: float(value) for name, value in zip(class_names, probabilities)}
+            prediction_rows[episode_id][step_id][f"{x_coord},{y_coord}"] = {
+                "label": str(pred_label),
+                "target": target,
+                "confidence": float(max(probabilities)),
+                "probabilities": prob_map,
+                "correct": bool(str(pred_label) == target),
+                "task": task,
+            }
+
+        print(
+            f"[viewer/v3] probe {task_index:02d}/25 {task} "
+            f"acc={accuracy:.3f} macro_f1={macro_f1:.3f}"
+        )
+
+    # Convert defaultdicts to ordinary dictionaries before serialization.
+    predictions = {
+        episode: {step: dict(cells) for step, cells in steps.items()}
+        for episode, steps in prediction_rows.items()
+    }
+    cache = {
+        "schema": CACHE_SCHEMA,
+        "split": {
+            "kind": "deterministic_episode_5fold_oof" if n_folds == 5 else "deterministic_episode_kfold_oof",
+            "n_folds": n_folds,
+            "selected_fold": selected_fold,
+            "train_fraction": (n_folds - 1) / n_folds,
+            "test_fraction": 1 / n_folds,
+            "fold_by_episode": fold_by_episode,
+        },
+        "activation_site": {"position": position, "layer": layer},
+        "tasks": task_names,
+        "task_metrics": task_metrics,
+        "predictions": predictions,
+    }
+    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[viewer/v3] saved_cache={cache_path}")
+    return cache, cache_path
+
+
+def extract_cell_map(row: Mapping[str, Any], pattern: re.Pattern[str], valid: set[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in row.items():
+        match = pattern.match(str(key))
+        if not match:
+            continue
+        label = str(value)
+        if label not in valid:
+            raise RuntimeError(f"Invalid label {label!r} for {key}")
+        x_coord, y_coord = map(int, match.groups())
+        result[f"{x_coord},{y_coord}"] = label
+    return result
+
+
+def parse_position(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        x = first_present(value, ("x", "col", "column"))
+        y = first_present(value, ("y", "row"))
+        if x is not None and y is not None:
+            return [int(x), int(y)]
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return [int(value[0]), int(value[1])]
+    if isinstance(value, str):
+        numbers = re.findall(r"-?\d+", value)
+        if len(numbers) >= 2:
+            return [int(numbers[0]), int(numbers[1])]
+    return None
+
+
+def explicit_map_from_step(step: Mapping[str, Any], width: int, height: int) -> dict[str, str]:
+    value = first_present(
+        step,
+        ("parsed_belief_grid", "belief_grid", "model_belief_grid", "explicit_belief_grid"),
+    )
+    if value is None:
+        parsed = step.get("parsed_response")
+        if isinstance(parsed, dict):
+            value = first_present(parsed, ("belief_grid", "grid"))
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            rows = [re.findall(r"[FOU]", line.upper()) for line in value.splitlines()]
+            value = [row for row in rows if row]
+    result: dict[str, str] = {}
+    if isinstance(value, dict):
+        for key, label_value in value.items():
+            pos = parse_position(key)
+            if pos is None:
+                match = re.search(r"x(\d+).*y(\d+)", str(key))
+                if match:
+                    pos = [int(match.group(1)), int(match.group(2))]
+            label = str(label_value).upper()
+            if pos is not None and label in VALID_BELIEF:
+                result[f"{pos[0]},{pos[1]}"] = label
+        return result
+    if isinstance(value, list) and value and all(isinstance(row, list) for row in value):
+        # Most prompts print the top row first. Convert display row to Cartesian y.
+        for row_index, row in enumerate(value[:height]):
+            y_coord = height - 1 - row_index
+            for x_coord, label_value in enumerate(row[:width]):
+                label = str(label_value).upper()
+                if label in VALID_BELIEF:
+                    result[f"{x_coord},{y_coord}"] = label
+    return result
+
+
+def infer_start_goal(run: Path, episode_steps: Sequence[Mapping[str, Any]], width: int, height: int) -> tuple[list[int], list[int]]:
+    first = episode_steps[0]
+    start = parse_position(first_present(first, ("start", "start_pos", "start_position")))
+    goal = parse_position(first_present(first, ("goal", "goal_pos", "goal_position", "target_pos")))
+    map_id = first_present(first, ("map_id", "map", "world_id"))
+    maps_path = run / "maps.jsonl"
+    if maps_path.is_file() and (start is None or goal is None):
+        for row in read_jsonl(maps_path):
+            row_map_id = first_present(row, ("map_id", "id", "map"))
+            if map_id is not None and str(row_map_id) != str(map_id):
+                continue
+            start = start or parse_position(first_present(row, ("start", "start_pos", "start_position")))
+            goal = goal or parse_position(first_present(row, ("goal", "goal_pos", "goal_position")))
+            if start is not None and goal is not None:
+                break
+    current0 = parse_position(first_present(first, ("current_pos", "position", "current_position")))
+    return start or current0 or [0, 0], goal or [width - 1, height - 1]
+
+
+def html_document(payload: dict[str, Any]) -> str:
+    data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    title = html.escape(f"Trajectory viewer — {payload['episode_id']}")
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>{title}</title>
+<style>
+:root {{ color-scheme: dark; --bg:#111827; --panel:#1f2937; --line:#374151; --muted:#9ca3af; --text:#f3f4f6; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }}
+header {{ position:sticky; top:0; z-index:5; background:#0b1220; border-bottom:1px solid var(--line); padding:14px 18px; }}
+header h1 {{ margin:0 0 10px; font-size:19px; }}
+.controls {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
+button,input {{ font:inherit; }}
+button {{ background:#273449; color:white; border:1px solid #4b5563; border-radius:7px; padding:7px 11px; cursor:pointer; }}
+button:hover {{ background:#34445e; }}
+input[type=range] {{ width:min(600px,55vw); }}
+.badge {{ border:1px solid var(--line); border-radius:999px; padding:5px 9px; color:#d1d5db; font-size:12px; }}
+main {{ padding:16px; max-width:1800px; margin:auto; }}
+.notice {{ padding:10px 12px; border:1px solid #166534; background:#052e16; border-radius:8px; margin-bottom:14px; }}
+.notice.error {{ border-color:#991b1b; background:#450a0a; }}
+.grid-panels {{ display:grid; grid-template-columns:repeat(4,minmax(250px,1fr)); gap:12px; }}
+.panel {{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0; }}
+.panel h2 {{ font-size:15px; margin:0 0 10px; }}
+.map {{ display:grid; gap:4px; align-items:stretch; }}
+.cell {{ aspect-ratio:1/1; min-height:46px; border:1px solid #4b5563; border-radius:6px; display:flex; flex-direction:column; align-items:center; justify-content:center; position:relative; font-weight:800; }}
+.cell .coord {{ position:absolute; top:3px; left:4px; font-size:9px; color:#cbd5e1; opacity:.75; font-weight:500; }}
+.cell .conf {{ font-size:9px; margin-top:2px; color:#e5e7eb; font-weight:500; }}
+.F {{ background:#14532d; }} .O {{ background:#7f1d1d; }} .U {{ background:#4b5563; }} .NA {{ background:#312e81; }}
+.cell.agent {{ outline:3px solid #facc15; outline-offset:-3px; }}
+.cell.start::after {{ content:'S'; position:absolute; right:4px; top:2px; color:#67e8f9; font-size:10px; }}
+.cell.goal::after {{ content:'G'; position:absolute; right:4px; bottom:2px; color:#f0abfc; font-size:10px; }}
+.details {{ display:grid; grid-template-columns:1.1fr 1fr; gap:12px; margin-top:12px; }}
+pre {{ white-space:pre-wrap; overflow-wrap:anywhere; max-height:520px; overflow:auto; background:#0b1220; border:1px solid var(--line); border-radius:8px; padding:10px; margin:0; font-size:12px; line-height:1.45; }}
+.kv {{ display:grid; grid-template-columns:max-content 1fr; gap:5px 12px; font-size:13px; }}
+.kv dt {{ color:var(--muted); }} .kv dd {{ margin:0; overflow-wrap:anywhere; }}
+.legend {{ color:var(--muted); font-size:11px; margin-top:8px; }}
+@media(max-width:1200px) {{ .grid-panels {{ grid-template-columns:repeat(2,minmax(240px,1fr)); }} }}
+@media(max-width:700px) {{ .grid-panels,.details {{ grid-template-columns:1fr; }} input[type=range] {{ width:100%; }} }}
+</style>
+</head>
+<body>
+<header>
+<h1>{title}</h1>
+<div class=\"controls\">
+<button id=\"prev\">Previous</button><button id=\"play\">Play</button><button id=\"next\">Next</button>
+<input id=\"slider\" type=\"range\" min=\"0\" max=\"0\" value=\"0\"><span class=\"badge\" id=\"stepBadge\"></span>
+<span class=\"badge\">OOF split: <span id=\"splitBadge\"></span></span>
+<span class=\"badge\">Site: <span id=\"siteBadge\"></span></span>
+</div>
+</header>
+<main>
+<div id=\"coverageNotice\" class=\"notice\"></div>
+<div class=\"grid-panels\">
+<section class=\"panel\"><h2>True map</h2><div id=\"trueMap\" class=\"map\"></div></section>
+<section class=\"panel\"><h2>Gold observable belief</h2><div id=\"goldMap\" class=\"map\"></div></section>
+<section class=\"panel\"><h2>Model explicit belief</h2><div id=\"explicitMap\" class=\"map\"></div></section>
+<section class=\"panel\"><h2>Probe-decoded gold belief</h2><div id=\"decodedMap\" class=\"map\"></div><div class=\"legend\">Each cell shows predicted F/O/U and confidence. Predictions are out-of-fold: the displayed episode was excluded from training.</div></section>
+</div>
+<div class=\"details\">
+<section class=\"panel\"><h2>Step details</h2><dl id=\"details\" class=\"kv\"></dl><h2 style=\"margin-top:14px\">Prompt</h2><pre id=\"prompt\"></pre></section>
+<section class=\"panel\"><h2>Model output</h2><pre id=\"output\"></pre><h2 style=\"margin-top:14px\">Decoded-cell diagnostics</h2><pre id=\"diag\"></pre></section>
+</div>
+</main>
+<script>
+const DATA = {data_json};
+let index = 0; let timer = null;
+const slider = document.getElementById('slider'); slider.max = Math.max(0, DATA.steps.length-1);
+function samePos(a,b) {{ return a && b && a[0]===b[0] && a[1]===b[1]; }}
+function renderMap(elementId, mapData, step, decoded=false) {{
+  const el = document.getElementById(elementId); el.innerHTML='';
+  el.style.gridTemplateColumns = `repeat(${{DATA.width}}, minmax(0,1fr))`;
+  for (let y=DATA.height-1; y>=0; y--) {{
+    for (let x=0; x<DATA.width; x++) {{
+      const key = `${{x}},${{y}}`; const record = mapData ? mapData[key] : null;
+      const label = decoded ? (record?.label || 'N/A') : (record || 'N/A');
+      const cell = document.createElement('div');
+      cell.className = `cell ${{['F','O','U'].includes(label) ? label : 'NA'}}`;
+      if (samePos(step.current_pos,[x,y])) cell.classList.add('agent');
+      if (samePos(DATA.start,[x,y])) cell.classList.add('start');
+      if (samePos(DATA.goal,[x,y])) cell.classList.add('goal');
+      const coord = document.createElement('span'); coord.className='coord'; coord.textContent=`(${{x}},${{y}})`; cell.appendChild(coord);
+      const main = document.createElement('span'); main.textContent=label; cell.appendChild(main);
+      if (decoded && record) {{ const conf=document.createElement('span'); conf.className='conf'; conf.textContent=`${{(100*record.confidence).toFixed(1)}}%`; cell.appendChild(conf); cell.title=JSON.stringify(record.probabilities); }}
+      el.appendChild(cell);
+    }}
+  }}
+}}
+function setDetails(step) {{
+  const fields = [
+    ['Step', step.step_id], ['Current position', JSON.stringify(step.current_pos)], ['Next position', JSON.stringify(step.next_pos)],
+    ['Requested action', step.requested_action ?? 'N/A'], ['Executed action', step.action ?? 'N/A'],
+    ['Repeated position', String(step.position_seen_before)], ['Repeated position-action', String(step.position_action_seen_before)],
+    ['Decoded correct cells', `${{step.decoded_correct}} / ${{step.decoded_count}}`], ['Mean decoded confidence', step.decoded_mean_confidence.toFixed(3)]
+  ];
+  const dl=document.getElementById('details'); dl.innerHTML='';
+  for (const [k,v] of fields) {{ const dt=document.createElement('dt'); dt.textContent=k; const dd=document.createElement('dd'); dd.textContent=String(v); dl.append(dt,dd); }}
+}}
+function render() {{
+  const step=DATA.steps[index]; slider.value=index;
+  document.getElementById('stepBadge').textContent=`Step ${{index+1}}/${{DATA.steps.length}} · id=${{step.step_id}}`;
+  document.getElementById('splitBadge').textContent=`fold ${{DATA.split.selected_fold+1}}/${{DATA.split.n_folds}} (${{Math.round(100*DATA.split.train_fraction)}}/${{Math.round(100*DATA.split.test_fraction)}})`;
+  document.getElementById('siteBadge').textContent=`${{DATA.activation_site.position}} / L${{DATA.activation_site.layer}}`;
+  const notice=document.getElementById('coverageNotice');
+  if (step.decoded_count===DATA.width*DATA.height) {{ notice.className='notice'; notice.textContent=`Decoded coverage: ${{step.decoded_count}}/${{DATA.width*DATA.height}} cells. Cache schema validated.`; }}
+  else {{ notice.className='notice error'; notice.textContent=`ERROR: decoded coverage is ${{step.decoded_count}}/${{DATA.width*DATA.height}}. This HTML should not have been generated without --allow-missing.`; }}
+  renderMap('trueMap', DATA.true_map, step, false); renderMap('goldMap', step.gold_belief, step, false);
+  renderMap('explicitMap', step.explicit_belief, step, false); renderMap('decodedMap', step.decoded_belief, step, true);
+  setDetails(step); document.getElementById('prompt').textContent=step.prompt || ''; document.getElementById('output').textContent=step.output || '';
+  const wrong=Object.entries(step.decoded_belief).filter(([_,r])=>!r.correct).map(([coord,r])=>`${{coord}}: pred=${{r.label}} gold=${{r.target}} conf=${{r.confidence.toFixed(3)}}`);
+  document.getElementById('diag').textContent=wrong.length ? wrong.join(String.fromCharCode(10)) : 'All decoded cells match the gold belief at this step.';
+}}
+function move(delta) {{ index=Math.max(0,Math.min(DATA.steps.length-1,index+delta)); render(); }}
+document.getElementById('prev').onclick=()=>move(-1); document.getElementById('next').onclick=()=>move(1);
+slider.oninput=()=>{{ index=Number(slider.value); render(); }};
+document.getElementById('play').onclick=()=>{{ const b=document.getElementById('play'); if(timer){{clearInterval(timer);timer=null;b.textContent='Play';return;}} b.textContent='Pause'; timer=setInterval(()=>{{ if(index>=DATA.steps.length-1){{clearInterval(timer);timer=null;b.textContent='Play';}} else move(1); }},900); }};
+render();
+</script>
+</body></html>"""
+
+
+def build_payload(run: Path, episode_id: str, cache: Mapping[str, Any], allow_missing: bool) -> dict[str, Any]:
+    steps_all = read_jsonl(run / "steps.jsonl")
+    targets_all = read_jsonl(run / "targets" / "targets.jsonl")
+    episode_steps = [row for row in steps_all if episode_id_of(row) == episode_id]
+    episode_targets = [row for row in targets_all if episode_id_of(row) == episode_id]
+    if not episode_steps:
+        raise RuntimeError(f"No steps for episode {episode_id!r}")
+    if not episode_targets:
+        raise RuntimeError(f"No targets for episode {episode_id!r}")
+
+    def _step_sort_key(row: Mapping[str, Any]) -> tuple[int, Any]:
+        value = step_id_of(row)
+        return (0, int(value)) if value.lstrip("-").isdigit() else (1, value)
+
+    episode_steps.sort(key=_step_sort_key)
+    target_by_step = {step_id_of(row, i): row for i, row in enumerate(episode_targets)}
+
+    first_target = target_by_step.get(step_id_of(episode_steps[0], 0), episode_targets[0])
+    true_map = extract_cell_map(first_target, TRUE_TASK_RE, VALID_TRUE)
+    if not true_map:
+        raise RuntimeError("No true_cell_x*_y*_FO fields found")
+    width = max(int(key.split(",")[0]) for key in true_map) + 1
+    height = max(int(key.split(",")[1]) for key in true_map) + 1
+    expected_cells = width * height
+    if len(true_map) != expected_cells:
+        raise RuntimeError(f"Incomplete true map: {len(true_map)}/{expected_cells}")
+
+    start, goal = infer_start_goal(run, episode_steps, width, height)
+    episode_predictions = cache.get("predictions", {}).get(episode_id, {})
+    payload_steps: list[dict[str, Any]] = []
+    seen_positions: set[tuple[int, int]] = set()
+    seen_pos_actions: set[tuple[tuple[int, int], str]] = set()
+    total_expected = 0
+    total_found = 0
+
+    for index, step in enumerate(episode_steps):
+        step_id = step_id_of(step, index)
+        target = target_by_step.get(step_id)
+        if target is None:
+            raise RuntimeError(f"Missing target row for episode={episode_id} step={step_id}")
+        step_true = extract_cell_map(target, TRUE_TASK_RE, VALID_TRUE)
+        if step_true and step_true != true_map:
+            raise RuntimeError(f"True map changes at step {step_id}")
+        gold = extract_cell_map(target, CELL_TASK_RE, VALID_BELIEF)
+        if len(gold) != expected_cells:
+            raise RuntimeError(f"Gold belief incomplete at step {step_id}: {len(gold)}/{expected_cells}")
+        for coord, label in gold.items():
+            if label != "U" and true_map[coord] != label:
+                raise RuntimeError(f"Gold belief contradicts true map at step={step_id} coord={coord}")
+
+        explicit = extract_cell_map(target, EXPLICIT_TASK_RE, VALID_BELIEF)
+        if not explicit:
+            explicit = explicit_map_from_step(step, width, height)
+        decoded = episode_predictions.get(step_id, {})
+        total_expected += expected_cells
+        total_found += len(decoded)
+        if len(decoded) != expected_cells and not allow_missing:
+            missing = sorted(set(true_map) - set(decoded))
+            raise RuntimeError(
+                f"Decoded prediction coverage failed for episode={episode_id} step={step_id}: "
+                f"{len(decoded)}/{expected_cells}; missing={missing}. "
+                "Use --force-probes to rebuild the canonical OOF cache."
+            )
+        for coord, record in decoded.items():
+            label = str(record.get("label"))
+            if label not in VALID_BELIEF:
+                raise RuntimeError(f"Invalid decoded label {label!r} at step={step_id} coord={coord}")
+
+        current_pos = parse_position(first_present(step, ("current_pos", "position", "current_position")))
+        next_pos = parse_position(first_present(step, ("next_pos", "next_position")))
+        action = first_present(step, ("action", "executed_action", "final_action"))
+        requested_action = first_present(step, ("requested_action", "model_action"), action)
+        pos_tuple = tuple(current_pos) if current_pos is not None else None
+        pos_seen = bool(pos_tuple in seen_positions) if pos_tuple is not None else False
+        pos_action_key = (pos_tuple, str(requested_action)) if pos_tuple is not None else None
+        pos_action_seen = bool(pos_action_key in seen_pos_actions) if pos_action_key is not None else False
+        if pos_tuple is not None:
+            seen_positions.add(pos_tuple)
+        if pos_action_key is not None:
+            seen_pos_actions.add(pos_action_key)
+
+        decoded_values = list(decoded.values())
+        decoded_correct = sum(bool(item.get("correct")) for item in decoded_values)
+        decoded_mean_confidence = (
+            float(np.mean([float(item.get("confidence", 0.0)) for item in decoded_values]))
+            if decoded_values
+            else 0.0
+        )
+        payload_steps.append(
+            {
+                "step_id": step_id,
+                "current_pos": current_pos,
+                "next_pos": next_pos,
+                "requested_action": requested_action,
+                "action": action,
+                "position_seen_before": pos_seen,
+                "position_action_seen_before": pos_action_seen,
+                "prompt": str(first_present(step, ("prompt_text", "prompt", "input_text"), "")),
+                "output": str(first_present(step, ("raw_response", "response", "model_output", "output_text"), "")),
+                "gold_belief": gold,
+                "explicit_belief": explicit,
+                "decoded_belief": decoded,
+                "decoded_count": len(decoded),
+                "decoded_correct": decoded_correct,
+                "decoded_mean_confidence": decoded_mean_confidence,
+            }
+        )
+
+    print(
+        f"[viewer/v3] decoded_coverage={total_found}/{total_expected} "
+        f"({100.0 * total_found / max(1,total_expected):.1f}%)"
+    )
+    return {
+        "schema": "trajectory-viewer-html-v3",
+        "episode_id": episode_id,
+        "width": width,
+        "height": height,
+        "start": start,
+        "goal": goal,
+        "true_map": true_map,
+        "steps": payload_steps,
+        "split": cache["split"],
+        "activation_site": cache["activation_site"],
+    }
+
+
+def list_episodes(run: Path) -> None:
+    rows = read_jsonl(run / "steps.jsonl")
+    counts = Counter(episode_id_of(row) for row in rows)
+    for episode_id, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        print(f"{episode_id}\tsteps={count}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", required=True, type=Path)
+    parser.add_argument("--episode")
+    parser.add_argument("--list-episodes", action="store_true")
+    parser.add_argument("--position", default="prompt_last")
+    parser.add_argument("--layer", default="auto", help="Layer number or 'auto'")
+    parser.add_argument("--folds", type=int, default=5, help="5 means 80/20 out-of-fold decoding")
+    parser.add_argument("--C", type=float, default=1.0)
+    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--force-probes", action="store_true")
+    parser.add_argument("--allow-missing", action="store_true", help="Debug only; normally missing predictions are fatal")
+    parser.add_argument("--output", type=Path)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run = args.run.resolve()
+    if args.list_episodes:
+        list_episodes(run)
+        return
+    if not args.episode:
+        raise SystemExit("--episode is required unless --list-episodes is used")
+    cache, cache_path = fit_oof_cell_probes(
+        run=run,
+        selected_episode=str(args.episode),
+        position=args.position,
+        requested_layer=args.layer,
+        n_folds=args.folds,
+        c_value=args.C,
+        max_iter=args.max_iter,
+        force=args.force_probes,
+    )
+    payload = build_payload(run, str(args.episode), cache, args.allow_missing)
+    output = args.output or run / "trajectory_viewer_v3" / f"{args.episode}.html"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html_document(payload), encoding="utf-8")
+    print(f"[trajectory_probe_viewer_v3] episode={args.episode}")
+    print(f"[trajectory_probe_viewer_v3] steps={len(payload['steps'])}")
+    print(f"[trajectory_probe_viewer_v3] cache={cache_path}")
+    print("[trajectory_probe_viewer_v3] coordinates=Cartesian(x-right,y-up,origin-bottom-left)")
+    print(f"[trajectory_probe_viewer_v3] output={output}")
+
+
+if __name__ == "__main__":
+    main()
+

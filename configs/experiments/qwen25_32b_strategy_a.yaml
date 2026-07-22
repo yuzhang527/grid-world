@@ -1,0 +1,20 @@
+experiment:
+  name: qwen25_7b_strategy_a
+  max_steps: 20
+  feedback_type: adjacent_exact
+model:
+  backend: vllm
+  name: Qwen/Qwen2.5-32B-Instruct
+  dtype: auto
+  trust_remote_code: false
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 256
+  seed: 123
+  gpu_memory_utilization: 0.90
+  max_model_len: 4096
+  max_num_seqs: 32
+  batch_size: 32
+  repair_invalid_json: true
+  enforce_eager: false
